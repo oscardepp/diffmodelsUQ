@@ -1,0 +1,2 @@
+UCI_Datasets/blog/data/data.txt filter=lfs diff=lfs merge=lfs -text
+UCI_Datasets/YearPredictionMSD/data/data.txt filter=lfs diff=lfs merge=lfs -text
