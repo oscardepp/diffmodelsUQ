@@ -1,0 +1,29 @@
+name: card_cdm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip=24.*
+  # Core scientific
+  - numpy=1.26.*
+  - scipy=1.11.*
+  - scikit-learn=1.4.*
+  - pandas=2.2.*
+  # PyTorch + CUDA 11.8
+  - pytorch=2.3.1
+  - pytorch-cuda=11.8
+  - torchvision=0.18.*
+  - torchaudio=2.3.*
+  # Utilities
+  - tqdm
+  - matplotlib=3.8.*
+  - pyyaml
+  # Optional: diffusion stack (needed only if RUN_CDM=True)
+  - pip:
+      - diffusers==0.29.0
+      - transformers==4.44.2
+      - accelerate==0.33.0
+      - safetensors>=0.4.2
