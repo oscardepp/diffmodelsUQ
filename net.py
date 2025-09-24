@@ -125,7 +125,7 @@ class net:
         standard_pred = standard_pred * self.std_y_train + self.mean_y_train
         rmse_standard_pred = np.mean((y_test.squeeze() - standard_pred.squeeze())**2.)**0.5
 
-        T = 10000
+        T = 500
         
         Yt_hat = np.array([model.predict(X_test, batch_size=500, verbose=0) for _ in range(T)])
         Yt_hat = Yt_hat * self.std_y_train + self.mean_y_train

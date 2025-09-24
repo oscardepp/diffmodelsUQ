@@ -41,8 +41,8 @@ _BASE_RESULTS_DIR = "/home/otd8990/UCI_Datasets/"
 _RESULTS_VALIDATION_LL = _BASE_RESULTS_DIR + data_directory + "/results/validation_ll_" + str(epochs_multiplier) + "_xepochs_" + str(num_hidden_layers) + "_hidden_layers.txt"
 _RESULTS_VALIDATION_RMSE = _BASE_RESULTS_DIR + data_directory + "/results/validation_rmse_" + str(epochs_multiplier) + "_xepochs_" + str(num_hidden_layers) + "_hidden_layers.txt"
 _RESULTS_VALIDATION_MC_RMSE = _BASE_RESULTS_DIR + data_directory + "/results/validation_MC_rmse_" + str(epochs_multiplier) + "_xepochs_" + str(num_hidden_layers) + "_hidden_layers.txt"
-_RESULTS_VALIDATION_COVERAGE = _BASE_RESULTS_DIR + f"validation_coverage_{epochs_multiplier}_xepochs_{num_hidden_layers}_hidden_layers.txt"
-_RESULTS_VALIDATION_WIDTH    = _BASE_RESULTS_DIR + f"validation_avg_width_{epochs_multiplier}_xepochs_{num_hidden_layers}_hidden_layers.txt"
+_RESULTS_VALIDATION_COVERAGE = _BASE_RESULTS_DIR + data_directory + f"/results/validation_coverage_{epochs_multiplier}_xepochs_{num_hidden_layers}_hidden_layers.txt"
+_RESULTS_VALIDATION_WIDTH    = _BASE_RESULTS_DIR + data_directory + f"/results/validation_avg_width_{epochs_multiplier}_xepochs_{num_hidden_layers}_hidden_layers.txt"
 
 
 _RESULTS_TEST_LL = _BASE_RESULTS_DIR + data_directory + "/results/test_ll_" + str(epochs_multiplier) + "_xepochs_" + str(num_hidden_layers) + "_hidden_layers.txt"
