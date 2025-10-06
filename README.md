@@ -171,11 +171,3 @@ If you need to verify the job sees GPUs, the job scripts include a commented-out
 - Add unit tests / smoke tests that run one epoch on a tiny synthetic dataset so users can validate the installation quickly.
 
 ---
-
-If you want, I can now:
-
-1. Update the SLURM scripts to use placeholders (e.g., ${USER}, ${HOME}/logs) so they're easier to reuse.
-2. Add short examples of how to change baked-in parameters inside the Python files.
-3. Create a small smoke-test script and add it to CI.
-
-Tell me which of these you'd like and I'll implement it.
