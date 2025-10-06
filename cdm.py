@@ -273,7 +273,8 @@ def pinball_loss(pred, y, q):
 # -----------------------------
 # CDM training & sampling (timed separately)
 # -----------------------------
-def train_cdm(diff_model, train_loader, epochs, timesteps, lr, weight_decay=0.0, clip=1.0):
+def train_cdm(diff_model, train_loader, epochs, timesteps, lr, weight_decay=0.0, clip=1.0,
+              val_loader=None, patience=10, checkpoint_path=None):
     noise_sched = DDPMScheduler(
         num_train_timesteps=timesteps,
         beta_schedule="squaredcos_cap_v2",
@@ -289,7 +290,12 @@ def train_cdm(diff_model, train_loader, epochs, timesteps, lr, weight_decay=0.0,
     total_wall_time = 0.0
     total_compute_time = 0.0
 
-    for _ in range(epochs):
+    # Early stopping state
+    best_val_loss = float("inf") if val_loader is not None else None
+    epochs_since_improve = 0
+    best_state = None
+
+    for epoch_idx in range(epochs):
         ep_compute_time = 0.0
         for xb, yb in train_loader:
             wall_start = time.perf_counter()
@@ -321,10 +327,62 @@ def train_cdm(diff_model, train_loader, epochs, timesteps, lr, weight_decay=0.0,
             total_wall_time    += (wall_end    - wall_start)
             total_steps        += 1
             ep_compute_time    += (compute_end - compute_start)
+        # End epoch
+        # Optionally run validation
+        val_loss = None
+        if val_loader is not None:
+            diff_model.eval()
+            losses = []
+            with torch.no_grad():
+                for vxb, vyb in val_loader:
+                    vxb = vxb.to(device, non_blocking=False)
+                    vyb = vyb.to(device, non_blocking=False)
+                    t = torch.randint(0, timesteps, (vxb.size(0),), device=device)
+                    noise = torch.randn_like(vyb)
+                    y_t = noise_sched.add_noise(vyb, noise, t)
+                    pred = diff_model(y_t, t, vxb)
+                    losses.append(F.mse_loss(pred, noise).item())
+            if len(losses) > 0:
+                val_loss = float(np.mean(losses))
+            diff_model.train()
+
+            # Early stopping logic
+            if val_loss is not None:
+                improved = val_loss < best_val_loss
+                if improved:
+                    best_val_loss = val_loss
+                    epochs_since_improve = 0
+                    # keep best state in memory
+                    best_state = deepcopy(diff_model.state_dict())
+                    # optionally persist to disk
+                    if checkpoint_path is not None:
+                        try:
+                            torch.save(best_state, checkpoint_path)
+                        except Exception:
+                            pass
+                else:
+                    epochs_since_improve += 1
+                if epochs_since_improve >= patience:
+                    print(f"Early stopping triggered at epoch {epoch_idx+1} (no improvement for {patience} epochs).")
+                    break
+
+        # end optional validation
 
     train_steps_per_sec_wall    = total_steps / max(1e-9, total_wall_time)
     train_steps_per_sec_compute = total_steps / max(1e-9, total_compute_time)
     total_train_wall_seconds    = total_wall_time
+
+    # restore best weights if we recorded them
+    if best_state is not None:
+        try:
+            diff_model.load_state_dict(best_state)
+        except Exception:
+            # best_state may have been saved to disk; attempt load from checkpoint_path
+            if checkpoint_path is not None and os.path.exists(checkpoint_path):
+                try:
+                    diff_model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+                except Exception:
+                    pass
 
     return dict(
         steps_per_sec_wall=train_steps_per_sec_wall,
@@ -332,6 +390,7 @@ def train_cdm(diff_model, train_loader, epochs, timesteps, lr, weight_decay=0.0,
         avg_time_per_step_wall=1.0/train_steps_per_sec_wall,
         total_train_wall_s=total_train_wall_seconds,
         noise_sched=noise_sched,
+        best_val_loss=best_val_loss,
     )
 
 @torch.no_grad()
@@ -533,10 +592,16 @@ def run_once(split_seed: int, BATCH: int):
             x_dim=xb_tr.shape[1], cond_dim=COND_DIM, time_embed_dim=TIME_EMB_DIM, drop_out=DROP_OUT
         ).to(device)
 
+        # Validation loader uses the calibration subset (acts as validation for early stopping)
+        val_loader = DataLoader(TensorDataset(xb_cal, yb_cal),
+                                batch_size=min(len(xb_cal), BATCH), shuffle=False, num_workers=0, pin_memory=False, drop_last=False)
+
         t_diff_train0 = time.perf_counter()
+        checkpoint_path = os.path.join(RESULTS_DIR, f"best_diff_model_seed{split_seed}.pt")
         train_info = train_cdm(
             diff_model=diff_model, train_loader=train_loader,
-            epochs=EPOCHS, timesteps=TIMESTEPS, lr=DIFF_LR, weight_decay=WEIGHT_DECAY, clip=CLIP_GRAD_NORM
+            epochs=EPOCHS, timesteps=TIMESTEPS, lr=DIFF_LR, weight_decay=WEIGHT_DECAY, clip=CLIP_GRAD_NORM,
+            val_loader=val_loader, patience=10, checkpoint_path=checkpoint_path
         )
         t_diff_train1 = time.perf_counter()
         diff_train_wall = t_diff_train1 - t_diff_train0
