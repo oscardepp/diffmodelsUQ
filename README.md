@@ -3,10 +3,11 @@ This repository contains implementations and scripts for evaluating uncertainty 
 - Deep Ensembles: `deep_ensemble.py`
 - Monte Carlo Dropout: `mcdropout.py` and related scripts
 - Neural net model code used by these methods: `net.py`
-- Example experiment/job scripts for Northwestern QUEST HPC: `scripts/*.sh`
+- Example experiment/job scripts for  QUEST HPC: `scripts/*.sh`
+  - UPDATE: privatized for anonymity
 - Prepared dataset splits under `UCI_Datasets/` (one folder per dataset)
 
-This README explains how to set up the environment, run experiments locally, and submit jobs to the Northwestern QUEST cluster. The Python scripts include baked-in parameters (see each file for exact defaults). The run scripts in `scripts/` demonstrate recommended SLURM settings for QUEST.
+This README explains how to set up the environment, run experiments locally, and submit jobs to the QUEST cluster. The Python scripts include baked-in parameters (see each file for exact defaults). The run scripts in `scripts/` demonstrate recommended SLURM settings for QUEST.
 
 ## Quick links
 
@@ -18,7 +19,7 @@ This README explains how to set up the environment, run experiments locally, and
 ## Repository contract (inputs / outputs)
 
 - Inputs: dataset folders under `UCI_Datasets/<dataset>/data/` and the Python scripts. Most scripts accept CLI args (see `--help`) but include baked defaults in the code and the `scripts/` wrappers.
-- Outputs: model checkpoints, logs, and results written relative to the working directory or dataset root (see each script for exact paths). SLURM job scripts redirect stdout/stderr to `/home/otd8990/logs/*.out` and `.err` in examples — customize those paths for your account.
+- Outputs: model checkpoints, logs, and results written relative to the working directory or dataset root (see each script for exact paths). SLURM job scripts redirect stdout/stderr to `/home/xyz1234/logs/*.out` and `.err` in examples — customize those paths for your account.
 
 ## Environment setup
 
@@ -93,7 +94,7 @@ Monte Carlo dropout example (script names vary; see `scripts/run_jobmcd.sh` for 
 
 ```bash
 conda activate mcdropout
-python -u experiment_oscar.py --dir naval-propulsion-plant --epochx 15 --hidden 2
+python -u mcdropout.py --dir naval-propulsion-plant --epochx 15 --hidden 2
 ```
 
 Notes:
@@ -102,7 +103,7 @@ Notes:
 - Use `python -u` to get unbuffered stdout so logs appear live in job output files.
 - Check the top of each Python file to see baked-in defaults. You can pass CLI args to override them when provided.
 
-## Submitting jobs on Northwestern QUEST (SLURM)
+## Submitting jobs on SLURM
 
 The `scripts/` directory contains example SLURM submission scripts which were used to run experiments on QUEST. They include recommended resource requests and environment activation steps. Customize them for your account and dataset paths.
 
@@ -127,7 +128,7 @@ What the job scripts do (high level):
 Customize these fields before running on QUEST:
 
 - `#SBATCH --account=` — set to your QUEST allocation/project
-- `#SBATCH --output` and `--error` — set to a directory you own (example uses `/home/otd8990/logs/`)
+- `#SBATCH --output` and `--error` — set to a directory you own (example uses `/home/xyz1234/logs/`)
 - `--partition`, `--constraint`, and `--gres` — match the hardware you want (A100-SXM shown in examples)
 
 Inspecting GPU in job logs
@@ -136,7 +137,7 @@ If you need to verify the job sees GPUs, the job scripts include a commented-out
 
 ## Where parameters live
 
-- Most script-level hyperparameters (epochs, dropout rates, dataset names) are provided via argparse CLI flags in the Python files but have defaults set in the source. Check the top of each Python file (`cdm.py`, `cdm_split_cqr.py`, `deep_ensemble.py`, `mcdropout.py`, `experiment_oscar.py`) to see the baked-in defaults.
+- Most script-level hyperparameters (epochs, dropout rates, dataset names) are provided via argparse CLI flags in the Python files but have defaults set in the source. Check the top of each Python file (`cdm.py`, `cdm_split_cqr.py`, `deep_ensemble.py`, `mcdropout.py`) to see the baked-in defaults.
 - The `UCI_Datasets/*/data/` folders include ancillary files like `n_epochs.txt` and `dropout_rates.txt` that were used by experiments; those help reproduce previously reported runs.
 
 ## Logging, outputs and checkpoints
