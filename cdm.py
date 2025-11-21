@@ -1,4 +1,4 @@
-# cdm_sc_cqr.py
+# cdm.py
 # ===============================================
 #  UCI regression: CDM + Split Conformal + CQR
 #  - Server friendly (ASCII prints)
@@ -46,6 +46,8 @@ def _parse_args():
     p.add_argument("--mlp_epochs", type=int, default=200)
     p.add_argument("--mlp_lr", type=float, default=1e-3)
     p.add_argument("--mlp_width", type=int, default=128)
+    p.add_argument("--mlp_layers", type=int, default=2,
+                   help="Number of hidden layers in SC/CQR MLPs (default: 2).")
 
     # Batch
     p.add_argument("--batch_override", type=int,
@@ -57,10 +59,12 @@ def _parse_args():
     p.add_argument("--samples", type=int, default=200, help="Samples per test point for CDM.")
     p.add_argument("--lr", type=float, default=1e-3, help="CDM learning rate.")
     p.add_argument("--weight_decay", type=float, default=0.0, help="CDM weight decay.")
-    p.add_argument("--dropout", type=float, default=0.20, help="CDM dropout.")
+    p.add_argument("--dropout", type=float, default=0.10, help="CDM dropout.")
     p.add_argument("--cond_dim", type=int, default=64, help="CDM conditioning embedding dim.")
     p.add_argument("--time_emb_dim", type=int, default=32, help="CDM time embedding dim.")
     p.add_argument("--clip_grad_norm", type=float, default=1.0, help="CDM grad clip.")
+    p.add_argument("--cdm_blocks", type=int, default=2,
+                   help="Number of ResidualBlocks in CDM backbone (default: 2).")
 
     return p.parse_args()
 
@@ -88,6 +92,7 @@ CAL_FRAC_OF_TRAIN   = args.cal_frac
 MLP_EPOCHS          = args.mlp_epochs
 MLP_LR              = args.mlp_lr
 MLP_WIDTH           = args.mlp_width
+MLP_LAYERS          = args.mlp_layers
 
 # CDM toggle & hyperparams
 RUN_CDM = True
@@ -105,6 +110,10 @@ N_SAMPLES      = args.samples
 DIFF_LR        = args.lr
 WEIGHT_DECAY   = args.weight_decay
 CLIP_GRAD_NORM = args.clip_grad_norm
+CDM_BLOCKS     = args.cdm_blocks
+
+# Quantile levels for CDM quantile loss (tied to ALPHA)
+QUANTILE_LEVELS = [ALPHA / 2.0, 0.5, 1.0 - ALPHA / 2.0]
 
 # Batch defaults (CARD-ish) with override
 def _norm(name: str) -> str:
@@ -123,7 +132,6 @@ CARD_BATCH = {
     _norm("yearpredictionmsd"): 1024,
     _norm("blog"): 512,
 }
-
 
 BATCH_DEFAULT = 512
 BATCH_OVERRIDE = args.batch_override
@@ -216,7 +224,7 @@ class ResidualBlock(nn.Module):
         return x + self.net(x)
 
 class ConditionalDenoiser(nn.Module):
-    def __init__(self, x_dim, cond_dim=64, time_embed_dim=32, drop_out=0.2):
+    def __init__(self, x_dim, cond_dim=64, time_embed_dim=32, drop_out=0.2, n_blocks=2):
         super().__init__()
         self.time_mlp = nn.Sequential(
             nn.Linear(time_embed_dim, 128),
@@ -228,17 +236,20 @@ class ConditionalDenoiser(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim)
         )
-        self.main = nn.Sequential(
+
+        # Build backbone with variable number of ResidualBlocks
+        main_layers = [
             nn.Linear(1 + 128 + cond_dim, 256),
             nn.SiLU(),
             nn.Dropout(drop_out),
-            ResidualBlock(256, p=drop_out),
-            nn.SiLU(),
-            nn.Dropout(drop_out),
-            ResidualBlock(256, p=drop_out),
-            nn.SiLU(),
-            nn.Linear(256, 1)
-        )
+        ]
+        for _ in range(max(0, n_blocks)):
+            main_layers.append(ResidualBlock(256, p=drop_out))
+            main_layers.append(nn.SiLU())
+            main_layers.append(nn.Dropout(drop_out))
+        main_layers.append(nn.Linear(256, 1))
+        self.main = nn.Sequential(*main_layers)
+
         self.time_embed_dim = time_embed_dim
 
     def forward(self, y_t, t, x_cond):
@@ -247,24 +258,43 @@ class ConditionalDenoiser(nn.Module):
         return self.main(torch.cat([y_t, emb_t, emb_x], dim=1))
 
 class RegressionMLP(nn.Module):
-    def __init__(self, d, width=128):
+    def __init__(self, d, width=128, depth=2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d, width), nn.SiLU(),
-            nn.Linear(width, width), nn.SiLU(),
-            nn.Linear(width, 1)
-        )
-    def forward(self,x): return self.net(x)
+        layers = []
+        if depth <= 0:
+            layers.append(nn.Linear(d, 1))
+        else:
+            # first hidden layer
+            layers.append(nn.Linear(d, width))
+            layers.append(nn.SiLU())
+            # additional hidden layers
+            for _ in range(depth - 1):
+                layers.append(nn.Linear(width, width))
+                layers.append(nn.SiLU())
+            # output
+            layers.append(nn.Linear(width, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
 
 class QuantileMLP(nn.Module):
-    def __init__(self, d, width=128):
+    def __init__(self, d, width=128, depth=2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d, width), nn.SiLU(),
-            nn.Linear(width, width), nn.SiLU(),
-            nn.Linear(width, 1)
-        )
-    def forward(self,x): return self.net(x)
+        layers = []
+        if depth <= 0:
+            layers.append(nn.Linear(d, 1))
+        else:
+            layers.append(nn.Linear(d, width))
+            layers.append(nn.SiLU())
+            for _ in range(depth - 1):
+                layers.append(nn.Linear(width, width))
+                layers.append(nn.SiLU())
+            layers.append(nn.Linear(width, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
 
 def pinball_loss(pred, y, q):
     e = y - pred
@@ -408,8 +438,8 @@ def sample_cdm(diff_model, noise_sched, x_norm, timesteps, n_samples):
 # -----------------------------
 # MLP training (point & quantiles)
 # -----------------------------
-def train_point_mlp(x_train, y_train, epochs, lr, width, batch):
-    model = RegressionMLP(x_train.shape[1], width=width).to(device)
+def train_point_mlp(x_train, y_train, epochs, lr, width, batch, depth):
+    model = RegressionMLP(x_train.shape[1], width=width, depth=depth).to(device)
     opt   = optim.AdamW(model.parameters(), lr=lr)
     ds    = TensorDataset(x_train, y_train)
     dl    = DataLoader(ds, batch_size=batch, shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
@@ -422,8 +452,8 @@ def train_point_mlp(x_train, y_train, epochs, lr, width, batch):
             opt.zero_grad(); loss.backward(); opt.step()
     return model
 
-def train_quantile_mlp(x_train, y_train, q, epochs, lr, width, batch):
-    model = QuantileMLP(x_train.shape[1], width=width).to(device)
+def train_quantile_mlp(x_train, y_train, q, epochs, lr, width, batch, depth):
+    model = QuantileMLP(x_train.shape[1], width=width, depth=depth).to(device)
     opt   = optim.AdamW(model.parameters(), lr=lr)
     ds    = TensorDataset(x_train, y_train)
     dl    = DataLoader(ds, batch_size=batch, shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
@@ -486,7 +516,19 @@ def pack_interval_metrics(y_true_raw, lo_raw, hi_raw, point_raw, also_gaussian_n
         out["nll"] = float(np.mean(nll))
     return out
 
-def pack_samples_metrics(y_true_raw, samples_raw):
+def quantile_pinball_loss(y_true, qhat, q):
+    """Scalar pinball loss for one quantile level q."""
+    e = y_true - qhat
+    return float(np.mean(np.maximum(q * e, (q - 1.0) * e)))
+
+def pack_samples_metrics(y_true_raw, samples_raw, samples_std=None, quantile_levels=QUANTILE_LEVELS):
+    """
+    Metrics from CDM samples.
+
+    - y_true_raw: true target in ORIGINAL scale.
+    - samples_raw: samples in ORIGINAL scale (N x S).
+    - samples_std: (optional) samples in STANDARDIZED scale (N x S) for normalized width.
+    """
     mu_np  = samples_raw.mean(1)
     std_np = samples_raw.std(1, ddof=1)
     lo_np  = np.quantile(samples_raw, ALPHA/2, axis=1)
@@ -500,7 +542,24 @@ def pack_samples_metrics(y_true_raw, samples_raw):
 
     std_safe = np.maximum(std_np, 1e-12)
     nll = float(np.mean(0.5*np.log(2*np.pi*std_safe**2) + 0.5*((y_np - mu_np)**2)/(std_safe**2)))
-    return dict(cov=cov, wid=wid, r2=r2, rmse=rmse, nll=nll)
+    out = dict(cov=cov, wid=wid, r2=r2, rmse=rmse, nll=nll)
+
+    # Normalized interval width (in standardized y-space) if samples_std provided
+    if samples_std is not None:
+        lo_std = np.quantile(samples_std, ALPHA/2, axis=1)
+        hi_std = np.quantile(samples_std, 1-ALPHA/2, axis=1)
+        wid_std = float(np.mean(hi_std - lo_std))
+        out["wid_norm"] = wid_std
+
+    # Quantile pinball losses for CDM samples (on original scale)
+    if quantile_levels is not None:
+        q_loss = {}
+        for q in quantile_levels:
+            qhat = np.quantile(samples_raw, q, axis=1)
+            q_loss[q] = quantile_pinball_loss(y_np, qhat, q)
+        out["q_loss"] = q_loss
+
+    return out
 
 # -----------------------------
 # One split: run_once(seed)
@@ -535,6 +594,7 @@ def run_once(split_seed: int, BATCH: int):
     print("   train: X=%s y=%s | test: X=%s y=%s" % (X_tr.shape, Y_tr.shape, X_te.shape, Y_te.shape))
     print("   batch=%d | epochs=%d | timesteps=%d | samples/pt=%d" % (BATCH, EPOCHS, TIMESTEPS, N_SAMPLES))
     print("   ALPHA=%.3f | CAL_FRAC_OF_TRAIN=%.3f" % (ALPHA, CAL_FRAC_OF_TRAIN))
+    print("   CDM blocks=%d | MLP layers=%d" % (CDM_BLOCKS, MLP_LAYERS))
 
     # ---- calibration subset ----
     rng = np.random.RandomState(split_seed)
@@ -553,31 +613,11 @@ def run_once(split_seed: int, BATCH: int):
     y_scale = float(y_scaler.scale_[0]); y_mean = float(y_scaler.mean_[0])
     def inv_y(t): return (t.cpu().numpy().reshape(-1,1) * y_scale + y_mean).reshape(-1)
 
-    # =======================
-    # Split Conformal (timed)
-    # =======================
-    # t_sc0 = time.perf_counter()
-    # lo_sc, hi_sc, pt_sc = split_conformal_intervals(
-    #     xb_tr_sc.clone(), yb_tr_sc.clone(),
-    #     xb_cal.clone(),   yb_cal.clone(),
-    #     xb_te.clone(),
-    #     alpha=ALPHA, width=MLP_WIDTH, epochs=MLP_EPOCHS, lr=MLP_LR, batch=BATCH
-    # )
+    # Split/CQR removed here; CDM only
     y_true_raw = inv_y(yb_te)
-    # sc_lo_raw  = inv_y(lo_sc)
-    # sc_hi_raw  = inv_y(hi_sc)
-    # sc_pt_raw  = inv_y(pt_sc)
-    # metrics_sc = pack_interval_metrics(y_true_raw, sc_lo_raw, sc_hi_raw, sc_pt_raw, also_gaussian_nll=True)
-    # t_sc1 = time.perf_counter()
-    # t_sc_total = t_sc1 - t_sc0
-
 
     result = dict(
         seed=split_seed,
-        # split=metrics_sc,
-        # # cqr=metrics_cqr,
-        # t_split_total_s=t_sc_total,
-        # t_cqr_total_s=t_cqr_total,
         batch=BATCH, epochs=EPOCHS
     )
 
@@ -589,7 +629,11 @@ def run_once(split_seed: int, BATCH: int):
                                   batch_size=BATCH, shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False)
 
         diff_model = ConditionalDenoiser(
-            x_dim=xb_tr.shape[1], cond_dim=COND_DIM, time_embed_dim=TIME_EMB_DIM, drop_out=DROP_OUT
+            x_dim=xb_tr.shape[1],
+            cond_dim=COND_DIM,
+            time_embed_dim=TIME_EMB_DIM,
+            drop_out=DROP_OUT,
+            n_blocks=CDM_BLOCKS,
         ).to(device)
 
         # Validation loader uses the calibration subset (acts as validation for early stopping)
@@ -612,20 +656,32 @@ def run_once(split_seed: int, BATCH: int):
         diff_model.eval()
         infer_times = []
         all_samples_raw = []
+        all_samples_std = []
         test_loader = DataLoader(TensorDataset(xb_te, yb_te),
                                  batch_size=BATCH, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False)
         for (xb, _) in test_loader:
             xb = xb.to(device, non_blocking=False)
             t0 = time.perf_counter()
-            samp_std = sample_cdm(diff_model, noise_sched, xb, TIMESTEPS, N_SAMPLES)
+            samp_std = sample_cdm(diff_model, noise_sched, xb, TIMESTEPS, N_SAMPLES)  # standardized samples
             if torch.cuda.is_available(): torch.cuda.synchronize()
             infer_times.append(time.perf_counter() - t0)
+
+            # store standardized samples for normalized width
+            all_samples_std.append(samp_std.cpu().numpy())
+
+            # unnormalize for original-scale metrics
             samp_raw = (samp_std.cpu().numpy() * y_scale + y_mean)
             all_samples_raw.append(samp_raw)
 
         infer_time_total = float(np.sum(infer_times))
-        samples_cat = np.concatenate(all_samples_raw, axis=0)
-        metrics_diff = pack_samples_metrics(y_true_raw, samples_cat)
+        samples_cat_raw = np.concatenate(all_samples_raw, axis=0)
+        samples_cat_std = np.concatenate(all_samples_std, axis=0)
+
+        metrics_diff = pack_samples_metrics(
+            y_true_raw=y_true_raw,
+            samples_raw=samples_cat_raw,
+            samples_std=samples_cat_std
+        )
 
         result.update(dict(
             diff=metrics_diff,
@@ -655,24 +711,21 @@ def _fmt_pct(ms):
 
 def summarise(rs):
     out = {}
-    def agg(obj_key, keys):
-        if all(r[obj_key] is not None for r in rs):
-            for k in keys:
-                vals = [r[obj_key][k] for r in rs]
-                out.setdefault(obj_key, {})[k] = (float(np.mean(vals)), float(np.std(vals)))
-        else:
-            out[obj_key] = None
-
-    # metrics
-    # agg("split", ["cov","wid","r2","rmse","nll"])
-    # agg("cqr",   ["cov","wid","r2","rmse","nll"])
+    # metrics for diff only
     if any(r.get("diff") is not None for r in rs):
         rs_diff = [r for r in rs if r.get("diff") is not None]
         if len(rs_diff) > 0:
             out["diff"] = {}
-            for k in ["cov","wid","r2","rmse","nll"]:
+            for k in ["cov","wid","wid_norm","r2","rmse","nll"]:
                 vals = [r["diff"][k] for r in rs_diff]
                 out["diff"][k] = (float(np.mean(vals)), float(np.std(vals)))
+            # quantile losses, if present
+            if "q_loss" in rs_diff[0]["diff"]:
+                q_keys = sorted(rs_diff[0]["diff"]["q_loss"].keys())
+                out["diff"]["q_loss"] = {}
+                for q in q_keys:
+                    vals = [r["diff"]["q_loss"][q] for r in rs_diff]
+                    out["diff"]["q_loss"][q] = (float(np.mean(vals)), float(np.std(vals)))
             # times
             out["t_diff_train_s"] = (float(np.mean([r["t_diff_train_s"] for r in rs_diff])),
                                      float(np.std ([r["t_diff_train_s"] for r in rs_diff])))
@@ -685,18 +738,14 @@ def summarise(rs):
     else:
         out["diff"] = None
 
-    # times (always collected for SC/CQR)
-    # out["t_split_total_s"] = (float(np.mean([r["t_split_total_s"] for r in rs])),
-    #                           float(np.std ([r["t_split_total_s"] for r in rs])))
-    # out["t_cqr_total_s"]   = (float(np.mean([r["t_cqr_total_s"]   for r in rs])),
-    #                           float(np.std ([r["t_cqr_total_s"]   for r in rs])))
-
     out["_meta"] = dict(
         dataset=data_directory,
         batch=rs[-1]["batch"],
         epochs=rs[-1]["epochs"],
         n_runs=len(rs),
-        run_cdm=(rs[-1].get("diff") is not None)
+        run_cdm=(rs[-1].get("diff") is not None),
+        cdm_blocks=CDM_BLOCKS,
+        mlp_layers=MLP_LAYERS,
     )
     return out
 
@@ -704,12 +753,12 @@ def pretty_print(tag, s, last_split_times=None):
     print("\n===== %s =====" % tag)
     print("Dataset  :", s['_meta']['dataset'])
     print("Batch    :", s['_meta']['batch'])
-    # print("DIFF_DP: :")
     print("Epochs   :", s['_meta']['epochs'])
     print("Runs     :", s['_meta']['n_runs'])
     print("CDM run? :", s['_meta']['run_cdm'])
+    print("CDM blocks:", s['_meta'].get("cdm_blocks"))
+    print("MLP layers:", s['_meta'].get("mlp_layers"))
 
-    # for lbl in ["split", "cqr", "diff"]:
     for lbl in ["diff"]:
         block = s.get(lbl)
         if block is None:
@@ -717,18 +766,23 @@ def pretty_print(tag, s, last_split_times=None):
         if block is not None:
             line = ("\n%-6s: " % lbl.upper() +
                     "COV %s | " % _fmt_pct(block['cov']) +
-                    "WIDTH %.3f+/-%.3f | " % (block['wid'][0], block['wid'][1]) +
+                    "WIDTH_raw %.3f+/-%.3f | " % (block['wid'][0], block['wid'][1]) +
+                    "WIDTH_norm %.3f+/-%.3f | " % (block['wid_norm'][0], block['wid_norm'][1]) +
                     "R2 %s | " % _fmt_pct(block['r2']) +
                     "RMSE %.3f+/-%.3f" % (block['rmse'][0], block['rmse'][1]))
             if "nll" in block:
                 line += " | NLL %.3f+/-%.3f" % (block['nll'][0], block['nll'][1])
             print(line)
+            # Print quantile pinball losses if present
+            if "q_loss" in block:
+                q_strs = []
+                for q, ms in block["q_loss"].items():
+                    m, sd = ms
+                    q_strs.append("q=%.3f: %.4f+/-%.4f" % (q, m, sd))
+                print("  Quantile pinball losses:", "; ".join(q_strs))
 
     # times (aggregated)
     print("\nTiming (mean +/- std over completed splits):")
-    # ts = s["t_split_total_s"]; tc = s["t_cqr_total_s"]
-    # print("  Split-Conformal total : %.2fs +/- %.2fs" % (ts[0], ts[1]))
-    # print("  CQR total             : %.2fs +/- %.2fs" % (tc[0], tc[1]))
     if s.get("diff") is not None:
         td_tr = s["t_diff_train_s"]; td_inf = s["t_diff_infer_s"]; td = s["t_diff_total_s"]
         print("  DIFF train            : %.2fs +/- %.2fs" % (td_tr[0], td_tr[1]))
@@ -738,8 +792,6 @@ def pretty_print(tag, s, last_split_times=None):
     # times (last split)
     if last_split_times is not None:
         print("\nLast split times:")
-        # print("  Split-Conformal total : %.2fs" % last_split_times["t_split_total_s"])
-        # print("  CQR total             : %.2fs" % last_split_times["t_cqr_total_s"])
         if "t_diff_total_s" in last_split_times:
             print("  DIFF train            : %.2fs" % last_split_times["t_diff_train_s"])
             print("  DIFF infer            : %.2fs" % last_split_times["t_diff_infer_s"])
@@ -751,32 +803,18 @@ def write_split_results(res, results_dir):
         with open(os.path.join(results_dir, fname), "a") as f:
             f.write(str(val) + "\n")
 
-    # split conformal
-    # w("split_cov.txt",  res["split"]["cov"])
-    # w("split_width.txt",res["split"]["wid"])
-    # w("split_r2.txt",   res["split"]["r2"])
-    # w("split_rmse.txt", res["split"]["rmse"])
-    # w("split_nll.txt",  res["split"]["nll"])
-    # w("split_time_total_s.txt", res["t_split_total_s"])
-
-    # cqr
-    # w("cqr_cov.txt",  res["cqr"]["cov"])
-    # w("cqr_width.txt",res["cqr"]["wid"])
-    # w("cqr_r2.txt",   res["cqr"]["r2"])
-    # w("cqr_rmse.txt", res["cqr"]["rmse"])
-    # w("cqr_nll.txt",  res["cqr"]["nll"])
-    # w("cqr_time_total_s.txt", res["t_cqr_total_s"])
-
     # diff (if present)
     if res.get("diff") is not None:
-        w("diff_cov.txt",  res["diff"]["cov"])
-        w("diff_width.txt",res["diff"]["wid"])
-        w("diff_r2.txt",   res["diff"]["r2"])
-        w("diff_rmse.txt", res["diff"]["rmse"])
-        w("diff_nll.txt",  res["diff"]["nll"])
+        w("diff_cov.txt",          res["diff"]["cov"])
+        w("diff_width.txt",        res["diff"]["wid"])
+        w("diff_width_norm.txt",   res["diff"].get("wid_norm", float("nan")))
+        w("diff_r2.txt",           res["diff"]["r2"])
+        w("diff_rmse.txt",         res["diff"]["rmse"])
+        w("diff_nll.txt",          res["diff"]["nll"])
         w("diff_time_train_s.txt", res["t_diff_train_s"])
         w("diff_time_infer_s.txt", res["t_diff_infer_s"])
         w("diff_time_total_s.txt", res["t_diff_total_s"])
+        # You could also log q_loss per-quantile here in separate files if desired.
 
 def write_final_log(tag, summary, results_dir):
     log_path = os.path.join(results_dir, "aggregate_log.txt")
@@ -787,6 +825,8 @@ def write_final_log(tag, summary, results_dir):
         f.write("Epochs   : %s\n" % summary['_meta']['epochs'])
         f.write("Runs     : %s\n" % summary['_meta']['n_runs'])
         f.write("CDM run? : %s\n" % summary['_meta']['run_cdm'])
+        f.write("CDM blocks: %s\n" % summary['_meta'].get("cdm_blocks"))
+        f.write("MLP layers: %s\n" % summary['_meta'].get("mlp_layers"))
 
         def line(lbl):
             block = summary.get(lbl)
@@ -795,21 +835,23 @@ def write_final_log(tag, summary, results_dir):
             def pct(ms): m, s = ms; return "%.2f%% +/- %.2f%%" % (m*100.0, s*100.0)
             out = ("\n%s: " % lbl.upper() +
                    "COV %s | " % pct(block['cov']) +
-                   "WIDTH %.3f+/-%.3f | " % (block['wid'][0], block['wid'][1]) +
+                   "WIDTH_raw %.3f+/-%.3f | " % (block['wid'][0], block['wid'][1]) +
+                   "WIDTH_norm %.3f+/-%.3f | " % (block['wid_norm'][0], block['wid_norm'][1]) +
                    "R2 %s | " % pct(block['r2']) +
                    "RMSE %.3f+/-%.3f" % (block['rmse'][0], block['rmse'][1]))
             if "nll" in block:
                 out += " | NLL %.3f+/-%.3f" % (block['nll'][0], block['nll'][1])
             f.write(out + "\n")
+            if "q_loss" in block:
+                f.write("  Quantile pinball losses:\n")
+                for q, ms in block["q_loss"].items():
+                    m, sd = ms
+                    f.write("    q=%.3f: %.4f+/-%.4f\n" % (q, m, sd))
 
-        # for lbl in ["split", "cqr", "diff"]:
         for lbl in ["diff"]:
             line(lbl)
 
-        # ts = summary["t_split_total_s"]; tc = summary["t_cqr_total_s"]
         f.write("\nTiming (mean +/- std):\n")
-        # f.write("  Split-Conformal total : %.2fs +/- %.2fs\n" % (ts[0], ts[1]))
-        # f.write("  CQR total             : %.2fs +/- %.2fs\n" % (tc[0], tc[1]))
         if summary.get("diff") is not None:
             td_tr = summary["t_diff_train_s"]; td_inf = summary["t_diff_infer_s"]; td = summary["t_diff_total_s"]
             f.write("  DIFF train            : %.2fs +/- %.2fs\n" % (td_tr[0], td_tr[1]))
@@ -835,10 +877,6 @@ for k, seed in enumerate(SEEDS, 1):
 
     all_results.append(res)
     last_times = {}
-    # last_times = dict(
-    #     t_split_total_s=res["t_split_total_s"],
-    #     t_cqr_total_s=res["t_cqr_total_s"],
-    # )
     if res.get("diff") is not None:
         last_times.update(
             t_diff_train_s=res["t_diff_train_s"],

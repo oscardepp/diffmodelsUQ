@@ -106,6 +106,9 @@ DIFF_LR        = args.lr
 WEIGHT_DECAY   = args.weight_decay
 CLIP_GRAD_NORM = args.clip_grad_norm
 
+# Quantile levels for pinball loss (for CDM samples)
+QUANTILE_LEVELS = [ALPHA / 2.0, 0.5, 1.0 - ALPHA / 2.0]
+
 # Batch defaults (CARD-ish) with override
 def _norm(name: str) -> str:
     return name.lower().replace(" ", "").replace("_", "").replace("-", "")
@@ -123,7 +126,6 @@ CARD_BATCH = {
     _norm("yearpredictionmsd"): 1024,
     _norm("blog"): 512,
 }
-
 
 BATCH_DEFAULT = 512
 BATCH_OVERRIDE = args.batch_override
@@ -458,7 +460,19 @@ def pack_interval_metrics(y_true_raw, lo_raw, hi_raw, point_raw, also_gaussian_n
         out["nll"] = float(np.mean(nll))
     return out
 
-def pack_samples_metrics(y_true_raw, samples_raw):
+def quantile_pinball_loss(y_true, qhat, q):
+    """Scalar pinball loss for one quantile level q using numpy arrays."""
+    e = y_true - qhat
+    return float(np.mean(np.maximum(q * e, (q - 1.0) * e)))
+
+def pack_samples_metrics(y_true_raw, samples_raw, samples_std=None, quantile_levels=QUANTILE_LEVELS):
+    """
+    Metrics from CDM samples.
+
+    - y_true_raw: true target in ORIGINAL scale.
+    - samples_raw: samples in ORIGINAL scale (N x S).
+    - samples_std: (optional) samples in STANDARDIZED scale (N x S) for normalized width.
+    """
     mu_np  = samples_raw.mean(1)
     std_np = samples_raw.std(1, ddof=1)
     lo_np  = np.quantile(samples_raw, ALPHA/2, axis=1)
@@ -472,7 +486,24 @@ def pack_samples_metrics(y_true_raw, samples_raw):
 
     std_safe = np.maximum(std_np, 1e-12)
     nll = float(np.mean(0.5*np.log(2*np.pi*std_safe**2) + 0.5*((y_np - mu_np)**2)/(std_safe**2)))
-    return dict(cov=cov, wid=wid, r2=r2, rmse=rmse, nll=nll)
+    out = dict(cov=cov, wid=wid, r2=r2, rmse=rmse, nll=nll)
+
+    # Normalized interval width (in standardized y-space) if samples_std provided
+    if samples_std is not None:
+        lo_std = np.quantile(samples_std, ALPHA/2, axis=1)
+        hi_std = np.quantile(samples_std, 1-ALPHA/2, axis=1)
+        wid_std = float(np.mean(hi_std - lo_std))
+        out["wid_norm"] = wid_std
+
+    # Quantile pinball losses for CDM samples
+    if quantile_levels is not None:
+        q_loss = {}
+        for q in quantile_levels:
+            qhat = np.quantile(samples_raw, q, axis=1)
+            q_loss[q] = quantile_pinball_loss(y_np, qhat, q)
+        out["q_loss"] = q_loss
+
+    return out
 
 # -----------------------------
 # One split: run_once(seed)
@@ -540,6 +571,22 @@ def run_once(split_seed: int, BATCH: int):
     sc_hi_raw  = inv_y(hi_sc)
     sc_pt_raw  = inv_y(pt_sc)
     metrics_sc = pack_interval_metrics(y_true_raw, sc_lo_raw, sc_hi_raw, sc_pt_raw, also_gaussian_nll=True)
+
+    # normalized width for Split Conformal (standardized y-space)
+    lo_sc_std = lo_sc.cpu().numpy().reshape(-1)
+    hi_sc_std = hi_sc.cpu().numpy().reshape(-1)
+    metrics_sc["wid_norm"] = float(np.mean(hi_sc_std - lo_sc_std))
+
+    # quantile pinball losses for Split-Conformal
+    q_low  = ALPHA / 2.0
+    q_med  = 0.5
+    q_high = 1.0 - ALPHA / 2.0
+    metrics_sc["q_loss"] = {
+        q_low:  quantile_pinball_loss(y_true_raw, sc_lo_raw,  q_low),
+        q_med:  quantile_pinball_loss(y_true_raw, sc_pt_raw,  q_med),
+        q_high: quantile_pinball_loss(y_true_raw, sc_hi_raw,  q_high),
+    }
+
     t_sc1 = time.perf_counter()
     t_sc_total = t_sc1 - t_sc0
 
@@ -557,6 +604,19 @@ def run_once(split_seed: int, BATCH: int):
     cqr_hi_raw = inv_y(hi_cqr)
     cqr_pt_raw = inv_y(mid_cqr)
     metrics_cqr = pack_interval_metrics(y_true_raw, cqr_lo_raw, cqr_hi_raw, cqr_pt_raw, also_gaussian_nll=True)
+
+    # normalized width for CQR (standardized y-space)
+    lo_cqr_std = lo_cqr.cpu().numpy().reshape(-1)
+    hi_cqr_std = hi_cqr.cpu().numpy().reshape(-1)
+    metrics_cqr["wid_norm"] = float(np.mean(hi_cqr_std - lo_cqr_std))
+
+    # quantile pinball losses for CQR
+    metrics_cqr["q_loss"] = {
+        q_low:  quantile_pinball_loss(y_true_raw, cqr_lo_raw,  q_low),
+        q_med:  quantile_pinball_loss(y_true_raw, cqr_pt_raw,  q_med),
+        q_high: quantile_pinball_loss(y_true_raw, cqr_hi_raw,  q_high),
+    }
+
     t_cqr1 = time.perf_counter()
     t_cqr_total = t_cqr1 - t_cqr0
 
@@ -594,20 +654,28 @@ def run_once(split_seed: int, BATCH: int):
         diff_model.eval()
         infer_times = []
         all_samples_raw = []
+        all_samples_std = []
         test_loader = DataLoader(TensorDataset(xb_te, yb_te),
                                  batch_size=BATCH, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False)
         for (xb, _) in test_loader:
             xb = xb.to(device, non_blocking=False)
             t0 = time.perf_counter()
-            samp_std = sample_cdm(diff_model, noise_sched, xb, TIMESTEPS, N_SAMPLES)
+            samp_std = sample_cdm(diff_model, noise_sched, xb, TIMESTEPS, N_SAMPLES)  # standardized samples
             if torch.cuda.is_available(): torch.cuda.synchronize()
             infer_times.append(time.perf_counter() - t0)
+
+            all_samples_std.append(samp_std.cpu().numpy())
             samp_raw = (samp_std.cpu().numpy() * y_scale + y_mean)
             all_samples_raw.append(samp_raw)
 
         infer_time_total = float(np.sum(infer_times))
-        samples_cat = np.concatenate(all_samples_raw, axis=0)
-        metrics_diff = pack_samples_metrics(y_true_raw, samples_cat)
+        samples_cat_raw = np.concatenate(all_samples_raw, axis=0)
+        samples_cat_std = np.concatenate(all_samples_std, axis=0)
+        metrics_diff = pack_samples_metrics(
+            y_true_raw=y_true_raw,
+            samples_raw=samples_cat_raw,
+            samples_std=samples_cat_std
+        )
 
         result.update(dict(
             diff=metrics_diff,
@@ -637,6 +705,7 @@ def _fmt_pct(ms):
 
 def summarise(rs):
     out = {}
+
     def agg(obj_key, keys):
         if all(r[obj_key] is not None for r in rs):
             for k in keys:
@@ -645,27 +714,46 @@ def summarise(rs):
         else:
             out[obj_key] = None
 
-    # metrics
-    agg("split", ["cov","wid","r2","rmse","nll"])
-    agg("cqr",   ["cov","wid","r2","rmse","nll"])
-    if any(r.get("diff") is not None for r in rs):
-        rs_diff = [r for r in rs if r.get("diff") is not None]
-        if len(rs_diff) > 0:
-            out["diff"] = {}
-            for k in ["cov","wid","r2","rmse","nll"]:
-                vals = [r["diff"][k] for r in rs_diff]
-                out["diff"][k] = (float(np.mean(vals)), float(np.std(vals)))
-            # times
-            out["t_diff_train_s"] = (float(np.mean([r["t_diff_train_s"] for r in rs_diff])),
-                                     float(np.std ([r["t_diff_train_s"] for r in rs_diff])))
-            out["t_diff_infer_s"] = (float(np.mean([r["t_diff_infer_s"] for r in rs_diff])),
-                                     float(np.std ([r["t_diff_infer_s"] for r in rs_diff])))
-            out["t_diff_total_s"] = (float(np.mean([r["t_diff_total_s"] for r in rs_diff])),
-                                     float(np.std ([r["t_diff_total_s"] for r in rs_diff])))
-        else:
-            out["diff"] = None
+    # basic metrics for each method
+    agg("split", ["cov","wid","wid_norm","r2","rmse","nll"])
+    agg("cqr",   ["cov","wid","wid_norm","r2","rmse","nll"])
+
+    # DIFF block (may be missing if RUN_CDM=False)
+    rs_diff = [r for r in rs if r.get("diff") is not None]
+    if len(rs_diff) > 0:
+        out["diff"] = {}
+        for k in ["cov","wid","wid_norm","r2","rmse","nll"]:
+            vals = [r["diff"][k] for r in rs_diff]
+            out["diff"][k] = (float(np.mean(vals)), float(np.std(vals)))
+        out["t_diff_train_s"] = (float(np.mean([r["t_diff_train_s"] for r in rs_diff])),
+                                 float(np.std ([r["t_diff_train_s"] for r in rs_diff])))
+        out["t_diff_infer_s"] = (float(np.mean([r["t_diff_infer_s"] for r in rs_diff])),
+                                 float(np.std ([r["t_diff_infer_s"] for r in rs_diff])))
+        out["t_diff_total_s"] = (float(np.mean([r["t_diff_total_s"] for r in rs_diff])),
+                                 float(np.std ([r["t_diff_total_s"] for r in rs_diff])))
     else:
         out["diff"] = None
+
+    # helper: aggregate quantile pinball losses for a given key
+    def agg_q_loss(key, records):
+        if len(records) == 0:
+            return
+        if records[0].get(key) is None:
+            return
+        if "q_loss" not in records[0][key]:
+            return
+        out.setdefault(key, {})
+        out[key]["q_loss"] = {}
+        q_keys = sorted(records[0][key]["q_loss"].keys())
+        for q in q_keys:
+            vals = [r[key]["q_loss"][q] for r in records]
+            out[key]["q_loss"][q] = (float(np.mean(vals)), float(np.std(vals)))
+
+    # q-loss for split, cqr, diff (if present)
+    agg_q_loss("split", rs)
+    agg_q_loss("cqr",   rs)
+    if len(rs_diff) > 0:
+        agg_q_loss("diff", rs_diff)
 
     # times (always collected for SC/CQR)
     out["t_split_total_s"] = (float(np.mean([r["t_split_total_s"] for r in rs])),
@@ -693,16 +781,29 @@ def pretty_print(tag, s, last_split_times=None):
     for lbl in ["split", "cqr", "diff"]:
         block = s.get(lbl)
         if block is None:
-            print("\n%-6s : (not run)" % lbl.upper()); continue
-        if block is not None:
-            line = ("\n%-6s: " % lbl.upper() +
-                    "COV %s | " % _fmt_pct(block['cov']) +
-                    "WIDTH %.3f+/-%.3f | " % (block['wid'][0], block['wid'][1]) +
-                    "R2 %s | " % _fmt_pct(block['r2']) +
-                    "RMSE %.3f+/-%.3f" % (block['rmse'][0], block['rmse'][1]))
-            if "nll" in block:
-                line += " | NLL %.3f+/-%.3f" % (block['nll'][0], block['nll'][1])
-            print(line)
+            print("\n%-6s : (not run)" % lbl.upper())
+            continue
+
+        line = ("\n%-6s: " % lbl.upper() +
+                "COV %s | " % _fmt_pct(block['cov']) +
+                "WIDTH_raw %.3f+/-%.3f | " % (block['wid'][0], block['wid'][1]) +
+                "WIDTH_norm %.3f+/-%.3f | " % (block['wid_norm'][0], block['wid_norm'][1]) +
+                "R2 %s | " % _fmt_pct(block['r2']) +
+                "RMSE %.3f+/-%.3f" % (block['rmse'][0], block['rmse'][1]))
+        if "nll" in block:
+            line += " | NLL %.3f+/-%.3f" % (block['nll'][0], block['nll'][1])
+        print(line)
+
+        # Quantile pinball losses (if present)
+        if "q_loss" in block:
+            q_strs = []
+            means = []
+            for q, ms in sorted(block["q_loss"].items()):
+                m, sd = ms
+                means.append(m)
+                q_strs.append("q=%.3f: %.4f+/-%.4f" % (q, m, sd))
+            print("  Quantile pinball losses:", "; ".join(q_strs))
+            print("  Avg pinball loss (3-quantile mean): %.4f" % float(np.mean(means)))
 
     # times (aggregated)
     print("\nTiming (mean +/- std over completed splits):")
@@ -732,31 +833,35 @@ def write_split_results(res, results_dir):
             f.write(str(val) + "\n")
 
     # split conformal
-    w("split_cov.txt",  res["split"]["cov"])
-    w("split_width.txt",res["split"]["wid"])
-    w("split_r2.txt",   res["split"]["r2"])
-    w("split_rmse.txt", res["split"]["rmse"])
-    w("split_nll.txt",  res["split"]["nll"])
+    w("split_cov.txt",        res["split"]["cov"])
+    w("split_width.txt",      res["split"]["wid"])
+    w("split_width_norm.txt", res["split"].get("wid_norm", float("nan")))
+    w("split_r2.txt",         res["split"]["r2"])
+    w("split_rmse.txt",       res["split"]["rmse"])
+    w("split_nll.txt",        res["split"]["nll"])
     w("split_time_total_s.txt", res["t_split_total_s"])
 
     # cqr
-    w("cqr_cov.txt",  res["cqr"]["cov"])
-    w("cqr_width.txt",res["cqr"]["wid"])
-    w("cqr_r2.txt",   res["cqr"]["r2"])
-    w("cqr_rmse.txt", res["cqr"]["rmse"])
-    w("cqr_nll.txt",  res["cqr"]["nll"])
+    w("cqr_cov.txt",        res["cqr"]["cov"])
+    w("cqr_width.txt",      res["cqr"]["wid"])
+    w("cqr_width_norm.txt", res["cqr"].get("wid_norm", float("nan")))
+    w("cqr_r2.txt",         res["cqr"]["r2"])
+    w("cqr_rmse.txt",       res["cqr"]["rmse"])
+    w("cqr_nll.txt",        res["cqr"]["nll"])
     w("cqr_time_total_s.txt", res["t_cqr_total_s"])
 
     # diff (if present)
     if res.get("diff") is not None:
-        w("diff_cov.txt",  res["diff"]["cov"])
-        w("diff_width.txt",res["diff"]["wid"])
-        w("diff_r2.txt",   res["diff"]["r2"])
-        w("diff_rmse.txt", res["diff"]["rmse"])
-        w("diff_nll.txt",  res["diff"]["nll"])
+        w("diff_cov.txt",        res["diff"]["cov"])
+        w("diff_width.txt",      res["diff"]["wid"])
+        w("diff_width_norm.txt", res["diff"].get("wid_norm", float("nan")))
+        w("diff_r2.txt",         res["diff"]["r2"])
+        w("diff_rmse.txt",       res["diff"]["rmse"])
+        w("diff_nll.txt",        res["diff"]["nll"])
         w("diff_time_train_s.txt", res["t_diff_train_s"])
         w("diff_time_infer_s.txt", res["t_diff_infer_s"])
         w("diff_time_total_s.txt", res["t_diff_total_s"])
+        # If you later want per-quantile logs, you can add them here.
 
 def write_final_log(tag, summary, results_dir):
     log_path = os.path.join(results_dir, "aggregate_log.txt")
@@ -770,17 +875,32 @@ def write_final_log(tag, summary, results_dir):
 
         def line(lbl):
             block = summary.get(lbl)
-            if block is None: 
-                f.write("\n%s : (not run)\n" % lbl.upper()); return
-            def pct(ms): m, s = ms; return "%.2f%% +/- %.2f%%" % (m*100.0, s*100.0)
+            if block is None:
+                f.write("\n%s : (not run)\n" % lbl.upper())
+                return
+
+            def pct(ms):
+                m, s = ms
+                return "%.2f%% +/- %.2f%%" % (m*100.0, s*100.0)
+
             out = ("\n%s: " % lbl.upper() +
                    "COV %s | " % pct(block['cov']) +
-                   "WIDTH %.3f+/-%.3f | " % (block['wid'][0], block['wid'][1]) +
+                   "WIDTH_raw %.3f+/-%.3f | " % (block['wid'][0], block['wid'][1]) +
+                   "WIDTH_norm %.3f+/-%.3f | " % (block['wid_norm'][0], block['wid_norm'][1]) +
                    "R2 %s | " % pct(block['r2']) +
                    "RMSE %.3f+/-%.3f" % (block['rmse'][0], block['rmse'][1]))
             if "nll" in block:
                 out += " | NLL %.3f+/-%.3f" % (block['nll'][0], block['nll'][1])
             f.write(out + "\n")
+
+            if "q_loss" in block:
+                f.write("  Quantile pinball losses:\n")
+                means = []
+                for q, ms in sorted(block["q_loss"].items()):
+                    m, sd = ms
+                    means.append(m)
+                    f.write("    q=%.3f: %.4f+/-%.4f\n" % (q, m, sd))
+                f.write("  Avg pinball loss (3-quantile mean): %.4f\n" % float(np.mean(means)))
 
         for lbl in ["split", "cqr", "diff"]:
             line(lbl)

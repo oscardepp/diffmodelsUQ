@@ -242,15 +242,24 @@ def sample_from_ensemble(members, X, K=SAMPLES_PER_MEMBER):
     return samp.reshape(n, E*K)
 
 # ------------------------------
-# Metrics (std scale + raw width)
+# Metrics (std scale + raw width + quantile loss)
 # ------------------------------
+def _pinball_loss_np(y, q, tau):
+    e = y - q
+    return float(np.mean(np.maximum(tau * e, (tau - 1.0) * e)))
+
 def eval_from_samples_std_and_rawwidth(y_true_std, samples_std, y_scale):
+    # Predictive mean & std on standardized scale
     mu  = samples_std.mean(axis=1)
     std = samples_std.std(axis=1, ddof=1)
-    lo  = np.quantile(samples_std, 0.5*ALPHA, axis=1)
-    hi  = np.quantile(samples_std, 1-0.5*ALPHA, axis=1)
 
-    cov  = np.mean((y_true_std >= lo) & (y_true_std <= hi))
+    # Interval quantiles on standardized scale
+    tau_low  = 0.5 * ALPHA
+    tau_high = 1.0 - 0.5 * ALPHA
+    lo  = np.quantile(samples_std, tau_low,  axis=1)
+    hi  = np.quantile(samples_std, tau_high, axis=1)
+
+    cov     = np.mean((y_true_std >= lo) & (y_true_std <= hi))
     wid_std = np.mean(hi - lo)                 # standardized width (CARD-style)
     wid_raw = float(y_scale) * wid_std         # raw width via linear scaling
 
@@ -260,7 +269,37 @@ def eval_from_samples_std_and_rawwidth(y_true_std, samples_std, y_scale):
     std_safe = np.maximum(std, 1e-6)
     nll = np.mean(0.5*np.log(2*math.pi*std_safe**2) + 0.5*((y_true_std - mu)**2)/(std_safe**2))
 
-    return dict(cov=cov, wid_std=wid_std, wid_raw=wid_raw, r2=r2, rmse=rmse, nll=nll)
+    # -------- Quantile pinball losses (std + raw) --------
+    q_med_std = np.quantile(samples_std, 0.5, axis=1)
+
+    ql025_std = _pinball_loss_np(y_true_std, lo,        tau_low)
+    ql500_std = _pinball_loss_np(y_true_std, q_med_std, 0.5)
+    ql975_std = _pinball_loss_np(y_true_std, hi,        tau_high)
+
+    scale = abs(float(y_scale))
+    ql025_raw = scale * ql025_std
+    ql500_raw = scale * ql500_std
+    ql975_raw = scale * ql975_std
+
+    qlavg_std = (ql025_std + ql500_std + ql975_std) / 3.0
+    qlavg_raw = (ql025_raw + ql500_raw + ql975_raw) / 3.0
+
+    return dict(
+        cov=cov,
+        wid_std=wid_std,
+        wid_raw=wid_raw,
+        r2=r2,
+        rmse=rmse,
+        nll=nll,
+        ql025_std=ql025_std,
+        ql500_std=ql500_std,
+        ql975_std=ql975_std,
+        ql025_raw=ql025_raw,
+        ql500_raw=ql500_raw,
+        ql975_raw=ql975_raw,
+        qlavg_std=qlavg_std,
+        qlavg_raw=qlavg_raw,
+    )
 
 def _fmt_pct(mean_std_tuple):
     m, s = mean_std_tuple
@@ -297,7 +336,7 @@ def run_once(seed:int):
     print(f"   inference sampling: {samples_std.shape} samples in {infer_time:.2f}s "
           f"| total train {train_time_total:.2f}s | total {total_time:.2f}s")
 
-    # Metrics on standardized scale + raw width
+    # Metrics on standardized scale + raw width + quantile losses
     y_te_std = y_te.reshape(-1)
     y_scale = float(ys.scale_[0])
     metrics = eval_from_samples_std_and_rawwidth(y_te_std, samples_std, y_scale)
@@ -320,7 +359,12 @@ def run_once(seed:int):
 # Aggregation & printing
 # ------------------------------
 def summarise(rs):
-    keys = ["cov","wid_std","wid_raw","r2","rmse","nll"]
+    keys = [
+        "cov","wid_std","wid_raw","r2","rmse","nll",
+        "ql025_std","ql500_std","ql975_std",
+        "ql025_raw","ql500_raw","ql975_raw",
+        "qlavg_std","qlavg_raw",
+    ]
     out = {}
     for k in keys:
         vals = [r["metrics"][k] for r in rs]
@@ -347,6 +391,16 @@ def pretty_print(tag, s):
     print(f"R²      : {_fmt_pct(s['r2'])}")
     print(f"RMSE    : {s['rmse'][0]:.3f} ± {s['rmse'][1]:.3f}  (standardized units)")
     print(f"NLL     : {s['nll'][0]:.3f} ± {s['nll'][1]:.3f}  (standardized units)")
+    print(
+        "  Quantile pinball losses (raw): "
+        f"q=0.025: {s['ql025_raw'][0]:.4f}±{s['ql025_raw'][1]:.4f}; "
+        f"q=0.500: {s['ql500_raw'][0]:.4f}±{s['ql500_raw'][1]:.4f}; "
+        f"q=0.975: {s['ql975_raw'][0]:.4f}±{s['ql975_raw'][1]:.4f}"
+    )
+    print(
+        f"  Avg quantile pinball (raw, over 0.025/0.5/0.975): "
+        f"{s['qlavg_raw'][0]:.4f}±{s['qlavg_raw'][1]:.4f}"
+    )
     print(f"Train T : {s['t_train_total'][0]:.2f}s ± {s['t_train_total'][1]:.2f}s")
     print(f"Infer T : {s['t_infer'][0]:.2f}s ± {s['t_infer'][1]:.2f}s")
     print(f"Total T : {s['t_total'][0]:.2f}s ± {s['t_total'][1]:.2f}s")
@@ -365,6 +419,16 @@ FP_INFER_T    = os.path.join(RES_DIR, "test_infer_time_de.txt")
 FP_TOTAL_T    = os.path.join(RES_DIR, "test_total_time_de.txt")
 FP_LOG        = os.path.join(RES_DIR, "log_de.txt")
 
+# per-quantile pinball loss files (std & raw)
+FP_QL025_STD  = os.path.join(RES_DIR, "test_qpin_0.025_std_de.txt")
+FP_QL500_STD  = os.path.join(RES_DIR, "test_qpin_0.500_std_de.txt")
+FP_QL975_STD  = os.path.join(RES_DIR, "test_qpin_0.975_std_de.txt")
+FP_QL025_RAW  = os.path.join(RES_DIR, "test_qpin_0.025_raw_de.txt")
+FP_QL500_RAW  = os.path.join(RES_DIR, "test_qpin_0.500_raw_de.txt")
+FP_QL975_RAW  = os.path.join(RES_DIR, "test_qpin_0.975_raw_de.txt")
+FP_QLAVG_STD  = os.path.join(RES_DIR, "test_qpin_avg_std_de.txt")
+FP_QLAVG_RAW  = os.path.join(RES_DIR, "test_qpin_avg_raw_de.txt")
+
 def _safe_rm(p):
     try:
         if os.path.exists(p): os.remove(p)
@@ -372,8 +436,13 @@ def _safe_rm(p):
         print(f"[warn] could not remove {p}: {e}")
 
 def reset_result_files():
-    for p in [FP_COV, FP_WID_STD, FP_WID_RAW, FP_R2, FP_RMSE_STD, FP_NLL_STD,
-              FP_TRAIN_T, FP_INFER_T, FP_TOTAL_T, FP_LOG]:
+    for p in [
+        FP_COV, FP_WID_STD, FP_WID_RAW, FP_R2, FP_RMSE_STD, FP_NLL_STD,
+        FP_TRAIN_T, FP_INFER_T, FP_TOTAL_T, FP_LOG,
+        FP_QL025_STD, FP_QL500_STD, FP_QL975_STD,
+        FP_QL025_RAW, FP_QL500_RAW, FP_QL975_RAW,
+        FP_QLAVG_STD, FP_QLAVG_RAW,
+    ]:
         _safe_rm(p)
     print("Result files initialized in:", RES_DIR)
 
@@ -388,6 +457,15 @@ def append_split_results(r):
     with open(FP_TRAIN_T, "a") as f:  f.write(f"{r['t_train_total']}\n")
     with open(FP_INFER_T, "a") as f:  f.write(f"{r['t_infer']}\n")
     with open(FP_TOTAL_T, "a") as f:  f.write(f"{r['t_total']}\n")
+    # quantile pinball losses
+    with open(FP_QL025_STD, "a") as f: f.write(f"{m['ql025_std']}\n")
+    with open(FP_QL500_STD, "a") as f: f.write(f"{m['ql500_std']}\n")
+    with open(FP_QL975_STD, "a") as f: f.write(f"{m['ql975_std']}\n")
+    with open(FP_QL025_RAW, "a") as f: f.write(f"{m['ql025_raw']}\n")
+    with open(FP_QL500_RAW, "a") as f: f.write(f"{m['ql500_raw']}\n")
+    with open(FP_QL975_RAW, "a") as f: f.write(f"{m['ql975_raw']}\n")
+    with open(FP_QLAVG_STD, "a") as f: f.write(f"{m['qlavg_std']}\n")
+    with open(FP_QLAVG_RAW, "a") as f: f.write(f"{m['qlavg_raw']}\n")
 
 def append_final_log(summary):
     def _stats_line(name, tup, pct=False):
@@ -403,6 +481,14 @@ def append_final_log(summary):
         f.write(_stats_line("R2", summary["r2"], pct=True))
         f.write(f"RMSE_std {summary['rmse'][0]:.6f} +- {summary['rmse'][1]:.6f}\n")
         f.write(f"NLL_std {summary['nll'][0]:.6f} +- {summary['nll'][1]:.6f}\n")
+        f.write(f"QPin_std_0.025 {summary['ql025_std'][0]:.6f} +- {summary['ql025_std'][1]:.6f}\n")
+        f.write(f"QPin_std_0.500 {summary['ql500_std'][0]:.6f} +- {summary['ql500_std'][1]:.6f}\n")
+        f.write(f"QPin_std_0.975 {summary['ql975_std'][0]:.6f} +- {summary['ql975_std'][1]:.6f}\n")
+        f.write(f"QPin_raw_0.025 {summary['ql025_raw'][0]:.6f} +- {summary['ql025_raw'][1]:.6f}\n")
+        f.write(f"QPin_raw_0.500 {summary['ql500_raw'][0]:.6f} +- {summary['ql500_raw'][1]:.6f}\n")
+        f.write(f"QPin_raw_0.975 {summary['ql975_raw'][0]:.6f} +- {summary['ql975_raw'][1]:.6f}\n")
+        f.write(f"QPin_std_avg {summary['qlavg_std'][0]:.6f} +- {summary['qlavg_std'][1]:.6f}\n")
+        f.write(f"QPin_raw_avg {summary['qlavg_raw'][0]:.6f} +- {summary['qlavg_raw'][1]:.6f}\n")
         f.write(f"Train_total_s {summary['t_train_total'][0]:.6f} +- {summary['t_train_total'][1]:.6f}\n")
         f.write(f"Infer_s {summary['t_infer'][0]:.6f} +- {summary['t_infer'][1]:.6f}\n")
         f.write(f"Total_s {summary['t_total'][0]:.6f} +- {summary['t_total'][1]:.6f}\n")
